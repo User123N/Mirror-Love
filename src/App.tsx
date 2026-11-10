@@ -156,7 +156,20 @@ export default function App() {
       setSession(data as MirrorSession); setMode('viewer'); setRemoteName('Pantalla compartida');
       setNotice({ type: 'info', text: 'Conectando con la persona que comparte su pantalla…' });
       await startViewer(data as MirrorSession);
-    } catch (error) { setNotice({ type: 'error', text: error instanceof Error ? error.message : 'No se pudo entrar a la sala.' }); }
+    } catch (error) {
+      const dbError = error as { message?: string; code?: string; details?: string; hint?: string };
+      const codeLabel = dbError.code ? ` [${dbError.code}]` : '';
+      let detail = dbError.message || 'No se pudo entrar a la sala.';
+      if (dbError.code === 'PGRST202' || /could not find the function.*join_session/i.test(detail)) {
+        detail = 'Supabase no encuentra la función join_session. Ejecuta en el SQL Editor la migración supabase/migrations/003_repair_join_session.sql en ESTE proyecto y vuelve a intentar.';
+      } else if (dbError.code === 'PGRST301' || /JWT|token/i.test(detail)) {
+        detail = 'Tu sesión de acceso expiró o no es válida. Cierra sesión, vuelve a iniciar sesión e inténtalo otra vez.';
+      } else if (/La sala no existe|ya tiene participante|ha finalizado/i.test(detail)) {
+        detail = 'El código no corresponde a una sala disponible. Pide a la otra persona que cree una sala nueva y comparte el código recién generado.';
+      }
+      const extra = [dbError.details, dbError.hint].filter(Boolean).join(' — ');
+      setNotice({ type: 'error', text: `${detail}${codeLabel}${extra ? ` — ${extra}` : ''}` });
+    }
     finally { setBusy(false); }
   };
 
