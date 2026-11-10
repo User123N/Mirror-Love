@@ -9,3 +9,5 @@
 .control-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
 .control-actions .primary-button,.control-actions .secondary-button{flex:1;justify-content:center}
 @media(max-width:700px){.control-actions{flex-direction:column;align-items:stretch}.control-actions button{width:100%}.remote-preview video{max-height:240px}}
+
+.stage-placeholder[hidden]{display:none!important}
