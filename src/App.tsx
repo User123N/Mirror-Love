@@ -137,8 +137,17 @@ export default function App() {
 
   const createPeer = (current: MirrorSession, isHost: boolean) => {
     if (!supabase || !user) throw new Error('La sesión no está disponible.');
-    const pc = new RTCPeerConnection(getRtcConfig()); pcRef.current = pc;
-    pc.onicecandidate = event => { if (event.candidate) void sendSignal(supabase, current.id, user.id, 'ice', event.candidate.toJSON()).catch(() => setNotice({ type: 'error', text: 'No se pudo enviar un candidato de conexión.' })); };
+    // Capture narrowed, non-null references before registering asynchronous WebRTC callbacks.
+    const client = supabase;
+    const currentUser = user;
+    const pc = new RTCPeerConnection(getRtcConfig());
+    pcRef.current = pc;
+    pc.onicecandidate = event => {
+      if (event.candidate) {
+        void sendSignal(client, current.id, currentUser.id, 'ice', event.candidate.toJSON())
+          .catch(() => setNotice({ type: 'error', text: 'No se pudo enviar un candidato de conexión.' }));
+      }
+    };
     pc.onconnectionstatechange = () => {
       setConnected(pc.connectionState === 'connected');
       if (pc.connectionState === 'failed') setNotice({ type: 'error', text: 'No se pudo establecer la conexión. Prueba otra red o configura un servidor TURN.' });
@@ -151,7 +160,7 @@ export default function App() {
           try {
             const restartOffer = await pc.createOffer({ iceRestart: true });
             await pc.setLocalDescription(restartOffer);
-            await sendSignal(supabase, current.id, user.id, 'offer', restartOffer);
+            await sendSignal(client, current.id, currentUser.id, 'offer', restartOffer);
           } catch { setNotice({ type: 'error', text: 'No fue posible recuperar la conexión. Comprueba la red e inténtalo de nuevo.' }); }
         })();
       }
