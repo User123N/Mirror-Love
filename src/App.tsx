@@ -218,6 +218,12 @@ export default function App() {
     try {
       if (message.kind === 'offer' && !isHost) {
         await pc.setRemoteDescription(message.payload as RTCSessionDescriptionInit);
+        // Explicitly allow the joining participant to send as well as receive.
+        for (const transceiver of pc.getTransceivers()) {
+          if (transceiver.receiver.track.kind === 'video' || transceiver.receiver.track.kind === 'audio') {
+            transceiver.direction = 'sendrecv';
+          }
+        }
         await flushCandidates(pc);
         const answer = await pc.createAnswer(); await pc.setLocalDescription(answer);
         await sendSignal(supabase, current.id, user.id, 'answer', answer);
