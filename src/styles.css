@@ -11,3 +11,7 @@
 @media(max-width:700px){.control-actions{flex-direction:column;align-items:stretch}.control-actions button{width:100%}.remote-preview video{max-height:240px}}
 
 .stage-placeholder[hidden]{display:none!important}
+
+.video-stage{position:relative}
+.video-stage video{position:absolute;inset:0}
+.video-stage .stage-placeholder{position:absolute;inset:0;z-index:1}
