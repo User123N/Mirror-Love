@@ -90,20 +90,31 @@ export default function App() {
 
   const createSession = async () => {
     if (!supabase || !user) return;
+    const client = supabase;
     setBusy(true); setNotice(null);
     try {
       let created: MirrorSession | null = null;
+      let lastError: { message?: string; code?: string } | null = null;
       for (let attempt = 0; attempt < 4 && !created; attempt++) {
         const code = makeCode();
-        const { data, error } = await supabase.from('sessions').insert({ host_id: user.id, invite_code: code, status: 'waiting' }).select('*').single();
-        if (!error) created = data as MirrorSession;
-        else if (error.code !== '23505') throw error;
+        const { data: sessionId, error } = await client.rpc('create_session', { p_invite_code: code });
+        if (error) {
+          lastError = error;
+          if (error.code === '23505') continue;
+          throw new Error(`Supabase (${error.code || 'sin código'}): ${error.message}${error.details ? ' — ' + error.details : ''}${error.hint ? ' — ' + error.hint : ''}`);
+        }
+        if (!sessionId) throw new Error('Supabase no devolvió el identificador de la sala.');
+        const { data, error: fetchError } = await client.from('sessions').select('*').eq('id', sessionId).single();
+        if (fetchError) throw new Error(`La sala se creó, pero no se pudo leer (${fetchError.code || 'error'}): ${fetchError.message}`);
+        created = data as MirrorSession;
       }
-      if (!created) throw new Error('No se pudo generar un código único. Intenta de nuevo.');
-      setSession(created); setMode('host'); setNotice({ type: 'success', text: 'Sala creada. Comparte el código con la persona que verá tu pantalla.' });
+      if (!created) throw new Error(lastError?.message || 'No se pudo generar un código único. Intenta de nuevo.');
+      setSession(created); setMode('host'); setNotice({ type: 'success', text: 'Sala creada. Comparte el código con la otra persona.' });
       watchForViewer(created);
-    } catch (error) { setNotice({ type: 'error', text: error instanceof Error ? error.message : 'No se pudo crear la sala.' }); }
-    finally { setBusy(false); }
+    } catch (error) {
+      const detail = error && typeof error === 'object' && 'message' in error ? String((error as { message: unknown }).message) : String(error);
+      setNotice({ type: 'error', text: detail || 'No se pudo crear la sala. Revisa la configuración de Supabase.' });
+    } finally { setBusy(false); }
   };
 
   const watchForViewer = (current: MirrorSession) => {
@@ -142,6 +153,11 @@ export default function App() {
     const currentUser = user;
     const pc = new RTCPeerConnection(getRtcConfig());
     pcRef.current = pc;
+    // Negotiate both directions from the beginning so either participant can share later.
+    if (isHost) {
+      pc.addTransceiver('video', { direction: 'sendrecv' });
+      pc.addTransceiver('audio', { direction: 'sendrecv' });
+    }
     pc.onicecandidate = event => {
       if (event.candidate) {
         void sendSignal(client, current.id, currentUser.id, 'ice', event.candidate.toJSON())
@@ -165,7 +181,13 @@ export default function App() {
         })();
       }
     };
-    if (!isHost) pc.ontrack = event => { if (remoteVideo.current) { remoteVideo.current.srcObject = event.streams[0]; void remoteVideo.current.play().catch(() => undefined); } };
+    pc.ontrack = event => {
+      if (remoteVideo.current) {
+        const stream = event.streams[0] ?? new MediaStream([event.track]);
+        remoteVideo.current.srcObject = stream;
+        void remoteVideo.current.play().catch(() => undefined);
+      }
+    };
     return pc;
   };
 
@@ -216,6 +238,41 @@ export default function App() {
     for (const message of (existing ?? []) as SignalMessage[]) await handleSignal(message, current, isHost);
   };
 
+  const applyLocalStream = async (stream: MediaStream, pc: RTCPeerConnection) => {
+    const transceivers = pc.getTransceivers();
+    for (const track of stream.getTracks()) {
+      const transceiver = transceivers.find(item => item.receiver.track.kind === track.kind);
+      if (!transceiver) throw new Error(`La conexión no negoció un canal de ${track.kind}. Cierra la sala y crea una nueva.`);
+      await transceiver.sender.replaceTrack(track);
+    }
+    localStreamRef.current = stream;
+    if (localVideo.current) {
+      localVideo.current.srcObject = stream;
+      void localVideo.current.play().catch(() => undefined);
+    }
+    stream.getTracks().forEach(track => track.addEventListener('ended', () => void stopLocalShare(), { once: true }));
+    startedAt.current = Date.now();
+    setStreaming(true);
+  };
+
+  const stopLocalShare = async () => {
+    const stream = localStreamRef.current;
+    const pc = pcRef.current;
+    if (pc && stream) {
+      for (const track of stream.getTracks()) {
+        const transceiver = pc.getTransceivers().find(item => item.receiver.track.kind === track.kind);
+        if (transceiver) await transceiver.sender.replaceTrack(null).catch(() => undefined);
+      }
+    }
+    stream?.getTracks().forEach(track => track.stop());
+    localStreamRef.current = null;
+    if (localVideo.current) localVideo.current.srcObject = null;
+    startedAt.current = null;
+    setElapsed(0);
+    setStreaming(false);
+    setNotice({ type: 'info', text: 'Dejaste de compartir tu pantalla. La sala sigue abierta y puedes volver a compartir.' });
+  };
+
   const startHost = async () => {
     if (!supabase || !user || !session) return;
     if (!session.viewer_id) { setNotice({ type: 'info', text: 'Primero espera a que la otra persona entre con tu código.' }); return; }
@@ -223,20 +280,42 @@ export default function App() {
     setBusy(true); setNotice(null);
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 24, max: 30 } }, audio: true });
-      localStreamRef.current = stream;
-      if (localVideo.current) { localVideo.current.srcObject = stream; }
-      stream.getTracks().forEach(track => track.addEventListener('ended', () => void endSession(true), { once: true }));
-      const pc = createPeer(session, true);
-      stream.getTracks().forEach(track => pc.addTrack(track, stream));
-      await subscribeSignals(session, true);
-      const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
-      await sendSignal(supabase, session.id, user.id, 'offer', offer);
-      await supabase.from('sessions').update({ status: 'live' }).eq('id', session.id);
-      startedAt.current = Date.now(); setStreaming(true);
-      setNotice({ type: 'success', text: 'Estás compartiendo tu pantalla. Puedes detenerlo en cualquier momento.' });
+      let pc = pcRef.current;
+      if (!pc) {
+        pc = createPeer(session, true);
+        await subscribeSignals(session, true);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await sendSignal(supabase, session.id, user.id, 'offer', offer);
+        await supabase.from('sessions').update({ status: 'live' }).eq('id', session.id);
+      }
+      await applyLocalStream(stream, pc);
+      setNotice({ type: 'success', text: 'Compartes tu pantalla. La otra persona también puede compartir la suya desde su panel.' });
     } catch (error) {
-      cleanupConnection();
+      localStreamRef.current?.getTracks().forEach(track => track.stop());
+      localStreamRef.current = null;
       setNotice({ type: 'error', text: error instanceof Error ? error.message : 'No se pudo iniciar la transmisión.' });
+    } finally { setBusy(false); }
+  };
+
+  const startViewerShare = async () => {
+    if (!pcRef.current || !connected) {
+      setNotice({ type: 'info', text: 'Espera a que se establezca la conexión antes de compartir tu pantalla.' });
+      return;
+    }
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      setNotice({ type: 'error', text: 'Este navegador no permite compartir pantalla. Usa Chrome, Edge o Firefox mediante HTTPS.' });
+      return;
+    }
+    setBusy(true); setNotice(null);
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 24, max: 30 } }, audio: true });
+      await applyLocalStream(stream, pcRef.current);
+      setNotice({ type: 'success', text: 'Ahora ambos pueden ver las pantallas que han autorizado compartir.' });
+    } catch (error) {
+      localStreamRef.current?.getTracks().forEach(track => track.stop());
+      localStreamRef.current = null;
+      setNotice({ type: 'error', text: error instanceof Error ? error.message : 'No se pudo compartir tu pantalla.' });
     } finally { setBusy(false); }
   };
 
@@ -272,8 +351,8 @@ export default function App() {
   if (!user) return <main className="auth-layout"><section className="auth-aside"><div className="brand"><div className="brand-mark"><Heart size={21} fill="currentColor"/></div><span>MirrorLove</span><sup>24/7</sup></div><div className="aside-copy"><span className="eyebrow">CERCA, AUNQUE ESTÉN LEJOS</span><h1>Compartir también es una forma de estar.</h1><p>Una conexión privada y directa para compartir tu pantalla con alguien de confianza.</p><div className="trust-line"><ShieldCheck size={18}/> Sesiones autorizadas y controladas por ti</div></div><div className="aside-orbit orbit-one"/><div className="aside-orbit orbit-two"/><span className="aside-foot">MIRRORLOVE · CONEXIONES CON CONSENTIMIENTO</span></section><section className="auth-main"><form className="auth-card" onSubmit={handleAuth}><div className="mobile-brand"><div className="brand-mark"><Heart size={20} fill="currentColor"/></div><b>MirrorLove <sup>24/7</sup></b></div><span className="eyebrow">TU ESPACIO PRIVADO</span><h2>{isSignup ? 'Crea tu cuenta' : 'Qué bueno tenerte aquí'}</h2><p className="auth-sub">{isSignup ? 'Regístrate para empezar a compartir de forma segura.' : 'Inicia sesión para acceder a tus conexiones.'}</p>{isSignup && <label>Nombre visible<input value={displayName} onChange={e => setDisplayName(e.target.value)} placeholder="Cómo quieres aparecer" required minLength={2}/></label>}<label>Correo electrónico<input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="tu@correo.com" autoComplete="email" required/></label><label>Contraseña<div className="password-wrap"><input type={authPasswordVisible ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} placeholder="Mínimo 8 caracteres" autoComplete={isSignup ? 'new-password' : 'current-password'} minLength={8} required/><button type="button" className="icon-button" onClick={() => setAuthPasswordVisible(!authPasswordVisible)} aria-label="Mostrar u ocultar contraseña">{authPasswordVisible ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div></label>{notice && <NoticeBox notice={notice}/>}<button className="primary-button full" disabled={busy}>{busy ? 'Un momento…' : isSignup ? 'Crear cuenta' : 'Iniciar sesión'}<ChevronRight size={18}/></button><p className="switch-auth">{isSignup ? '¿Ya tienes cuenta?' : '¿Todavía no tienes cuenta?'} <button type="button" onClick={() => { setIsSignup(!isSignup); setNotice(null); }}> {isSignup ? 'Inicia sesión' : 'Regístrate'}</button></p><p className="legal-note"><ShieldCheck size={14}/> Comparte únicamente con personas a quienes hayas dado permiso.</p></form></section></main>;
 
   return <div className="app-shell"><aside className="sidebar"><div className="brand"><div className="brand-mark"><Heart size={20} fill="currentColor"/></div><span>MirrorLove</span><sup>24/7</sup></div><div className="side-label">ESPACIO PERSONAL</div><button className={`nav-item ${mode === 'home' ? 'active' : ''}`} onClick={() => { if (session) void endSession(); else { cleanupConnection(); setMode('home'); } }}><Laptop size={18}/> Panel principal</button><div className="sidebar-bottom"><div className="secure-mini"><ShieldCheck size={17}/><div><b>Tu privacidad importa</b><span>Controlas cada sesión</span></div></div><div className="user-chip"><div className="avatar">{(user.email?.[0] ?? 'M').toUpperCase()}</div><div className="user-details"><b>{user.user_metadata?.display_name || 'Mi cuenta'}</b><span>{user.email}</span></div><button className="icon-button" onClick={signOut} title="Cerrar sesión"><LogOut size={17}/></button></div></div></aside><main className="main-content"><header className="topbar"><div><span className="eyebrow">TU ESPACIO DIGITAL</span><h2>{mode === 'home' ? 'Panel principal' : mode === 'host' ? 'Compartir pantalla' : 'Ver pantalla'}</h2></div><div className="topbar-status"><span className="status-dot"/> Conexión segura</div></header><div className="content-wrap">{notice && <NoticeBox notice={notice}/>} {mode === 'home' && <><section className="welcome-banner"><div className="welcome-text"><span className="eyebrow">BIENVENIDO A MIRRORLOVE</span><h1>La distancia no tiene<br/>que sentirse tan grande.</h1><p>Inicia una conexión privada. Tú decides cuándo compartir y cuándo terminar.</p></div><div className="welcome-art"><div className="art-circle"><Heart size={45} strokeWidth={1.2}/><span className="art-spark spark-a">✦</span><span className="art-spark spark-b">✧</span></div><div className="art-caption"><span className="status-dot"/> CONEXIONES EN TIEMPO REAL</div></div></section><div className="section-heading"><div><span className="eyebrow">EMPIEZA EN UN MOMENTO</span><h3>¿Qué quieres hacer?</h3></div><span className="private-tag"><ShieldCheck size={14}/> Privado por diseño</span></div><div className="action-grid"><button className="action-card" onClick={createSession} disabled={busy}><div className="action-icon pink"><MonitorUp size={24}/></div><span className="card-kicker">EMITIR</span><h3>Compartir mi pantalla</h3><p>Crea una sala y comparte un código. La transmisión solo comienza cuando tú la autorizas.</p><span className="card-link">Crear sala <ChevronRight size={16}/></span></button><form className="action-card join-card" onSubmit={joinSession}><div className="action-icon violet"><Eye size={24}/></div><span className="card-kicker">RECIBIR</span><h3>Ver una pantalla</h3><p>Introduce el código de invitación que te compartieron para unirte a una sesión.</p><label className="code-label">CÓDIGO DE INVITACIÓN<input value={joinCode} onChange={e => setJoinCode(e.target.value.toUpperCase().slice(0, 8))} placeholder="ABCD2345" maxLength={8} autoCapitalize="characters"/></label><button className="primary-button" disabled={busy || joinCode.trim().length !== 8}>{busy ? 'Conectando…' : 'Unirme a la sala'}<ChevronRight size={17}/></button></form></div><section className="how-section"><div className="section-heading"><div><span className="eyebrow">SENCILLO Y TRANSPARENTE</span><h3>Así funciona</h3></div></div><div className="steps-grid"><div className="step"><span>01</span><b>Crea o recibe un código</b><p>Una persona crea la sala y comparte su invitación.</p></div><div className="step"><span>02</span><b>Confirma el permiso</b><p>Quien comparte elige la pantalla y confirma desde su navegador.</p></div><div className="step"><span>03</span><b>Conecta y controla</b><p>Ambas personas pueden terminar la sesión cuando quieran.</p></div></div></section></>}
-{mode === 'host' && session && <section className="session-layout"><div className="session-main-card"><div className="session-card-head"><div><span className="eyebrow">SALA DE TRANSMISIÓN</span><h3>Comparte tu pantalla</h3></div><span className={`live-pill ${connected ? 'is-live' : ''}`}><span className="status-dot"/>{connected ? 'Conectado' : streaming ? 'Conectando' : 'Esperando'}</span></div><div className="video-stage">{streaming ? <video ref={localVideo} autoPlay muted playsInline/> : <div className="stage-placeholder"><div className="stage-icon"><Monitor size={34}/></div><b>Tu pantalla aparecerá aquí</b><span>La captura solo comenzará cuando pulses el botón de compartir.</span></div>}</div><div className="stream-controls"><div className="stream-meta"><span><Radio size={15}/> {streaming ? 'TRANSMISIÓN ACTIVA' : 'TRANSMISIÓN DETENIDA'}</span><b>{formatTime(elapsed)}</b></div>{!streaming ? <button className="primary-button" onClick={startHost} disabled={busy || !session.viewer_id}><MonitorUp size={17}/>{busy ? 'Preparando…' : session.viewer_id ? 'Elegir pantalla y transmitir' : 'Esperando a que se una alguien'}</button> : <button className="danger-button" onClick={() => void endSession()}><Square size={16} fill="currentColor"/> Detener transmisión</button>}</div></div><aside className="session-side"><div className="invite-card"><span className="eyebrow">INVITA A ALGUIEN</span><h3>Tu código de sala</h3><p>Compártelo solo con la persona que quieres que vea tu pantalla.</p><div className="invite-code">{session.invite_code.split('').map((char, i) => <span key={i}>{char}</span>)}</div><button className="secondary-button full" onClick={copyCode}>{copied ? <Check size={16}/> : <Copy size={16}/>} {copied ? 'Copiado' : 'Copiar código'}</button><div className="invite-status"><span className={`status-dot ${session.viewer_id ? 'green' : ''}`}/>{session.viewer_id ? 'La persona se ha unido' : 'Esperando a la otra persona'}</div></div><div className="privacy-card"><ShieldCheck size={20}/><b>Control total</b><p>El navegador muestra su aviso de compartir pantalla. Puedes detenerlo desde aquí o desde el propio navegador.</p></div><button className="text-button" onClick={() => void endSession()}>Cerrar sala <X size={15}/></button></aside></section>}
-{mode === 'viewer' && session && <section className="session-layout viewer-layout"><div className="session-main-card"><div className="session-card-head"><div><span className="eyebrow">VISUALIZACIÓN EN DIRECTO</span><h3>{remoteName}</h3></div><span className={`live-pill ${connected ? 'is-live' : ''}`}><span className="status-dot"/>{connected ? 'En directo' : 'Conectando'}</span></div><div className="video-stage viewer-stage">{connected ? <video ref={remoteVideo} autoPlay playsInline/> : <div className="stage-placeholder"><div className="stage-icon"><Wifi size={34}/></div><b>Esperando la transmisión</b><span>La otra persona debe elegir qué pantalla compartir y autorizarlo.</span></div>}</div><div className="stream-controls"><div className="stream-meta"><span><Signal size={15}/> {connected ? 'CONEXIÓN ESTABLECIDA' : 'ESTABLECIENDO CONEXIÓN'}</span></div><button className="danger-button" onClick={() => void endSession()}>Salir de la sesión <LogOut size={16}/></button></div></div><aside className="session-side"><div className="invite-card viewer-info"><div className="action-icon violet"><Eye size={23}/></div><span className="eyebrow">SESIÓN AUTORIZADA</span><h3>Estás como espectador</h3><p>Solo puedes ver el contenido que la otra persona decidió compartir. No tienes acceso al resto del dispositivo.</p><div className="invite-status"><span className={`status-dot ${connected ? 'green' : ''}`}/>{connected ? 'Recibiendo pantalla' : 'Esperando al emisor'}</div></div><div className="privacy-card"><ShieldCheck size={20}/><b>Privacidad respetada</b><p>La transmisión se realiza directamente entre navegadores cuando la red lo permite.</p></div></aside></section>}
+{mode === 'host' && session && <section className="session-layout"><div className="session-main-card"><div className="session-card-head"><div><span className="eyebrow">SALA DE TRANSMISIÓN</span><h3>Comparte tu pantalla</h3></div><span className={`live-pill ${connected ? 'is-live' : ''}`}><span className="status-dot"/>{connected ? 'Conectado' : streaming ? 'Conectando' : 'Esperando'}</span></div><div className="video-stage">{streaming ? <video ref={localVideo} autoPlay muted playsInline/> : <div className="stage-placeholder"><div className="stage-icon"><Monitor size={34}/></div><b>Tu pantalla aparecerá aquí</b><span>La captura solo comenzará cuando pulses el botón de compartir.</span></div>}</div>{connected && <div className="remote-preview"><span className="eyebrow">PANTALLA DE LA OTRA PERSONA</span><video ref={remoteVideo} autoPlay playsInline/></div>}<div className="stream-controls"><div className="stream-meta"><span><Radio size={15}/> {streaming ? 'COMPARTIENDO TU PANTALLA' : 'TU TRANSMISIÓN DETENIDA'}</span><b>{formatTime(elapsed)}</b></div>{!streaming ? <button className="primary-button" onClick={startHost} disabled={busy || !session.viewer_id}><MonitorUp size={17}/>{busy ? 'Preparando…' : session.viewer_id ? 'Compartir mi pantalla' : 'Esperando a que se una alguien'}</button> : <button className="danger-button" onClick={() => void stopLocalShare()}><Square size={16} fill="currentColor"/> Dejar de compartir</button>}</div></div><aside className="session-side"><div className="invite-card"><span className="eyebrow">INVITA A ALGUIEN</span><h3>Tu código de sala</h3><p>Compártelo solo con la persona que quieres que vea tu pantalla.</p><div className="invite-code">{session.invite_code.split('').map((char, i) => <span key={i}>{char}</span>)}</div><button className="secondary-button full" onClick={copyCode}>{copied ? <Check size={16}/> : <Copy size={16}/>} {copied ? 'Copiado' : 'Copiar código'}</button><div className="invite-status"><span className={`status-dot ${session.viewer_id ? 'green' : ''}`}/>{session.viewer_id ? 'La persona se ha unido' : 'Esperando a la otra persona'}</div></div><div className="privacy-card"><ShieldCheck size={20}/><b>Control total</b><p>El navegador muestra su aviso de compartir pantalla. Puedes detenerlo desde aquí o desde el propio navegador.</p></div><button className="text-button" onClick={() => void endSession()}>Cerrar sala <X size={15}/></button></aside></section>}
+{mode === 'viewer' && session && <section className="session-layout viewer-layout"><div className="session-main-card"><div className="session-card-head"><div><span className="eyebrow">VISUALIZACIÓN EN DIRECTO</span><h3>{remoteName}</h3></div><span className={`live-pill ${connected ? 'is-live' : ''}`}><span className="status-dot"/>{connected ? 'En directo' : 'Conectando'}</span></div><div className="video-stage viewer-stage">{connected ? <video ref={remoteVideo} autoPlay playsInline/> : <div className="stage-placeholder"><div className="stage-icon"><Wifi size={34}/></div><b>Esperando la transmisión</b><span>La otra persona debe elegir qué pantalla compartir y autorizarlo.</span></div>}</div>{streaming && <div className="remote-preview"><span className="eyebrow">TU PANTALLA COMPARTIDA</span><video ref={localVideo} autoPlay muted playsInline/></div>}<div className="stream-controls"><div className="stream-meta"><span><Signal size={15}/> {connected ? 'CONEXIÓN ESTABLECIDA' : 'ESTABLECIENDO CONEXIÓN'}</span></div><div className="control-actions">{!streaming ? <button className="primary-button" onClick={startViewerShare} disabled={busy || !connected}><MonitorUp size={17}/>{busy ? 'Preparando…' : 'Compartir mi pantalla también'}</button> : <button className="danger-button" onClick={() => void stopLocalShare()}><Square size={16} fill="currentColor"/> Dejar de compartir</button>}<button className="secondary-button" onClick={() => void endSession()}>Salir de la sesión <LogOut size={16}/></button></div></div></div><aside className="session-side"><div className="invite-card viewer-info"><div className="action-icon violet"><Eye size={23}/></div><span className="eyebrow">SESIÓN AUTORIZADA</span><h3>Estás como espectador</h3><p>Solo puedes ver el contenido que la otra persona decidió compartir. No tienes acceso al resto del dispositivo.</p><div className="invite-status"><span className={`status-dot ${connected ? 'green' : ''}`}/>{connected ? 'Recibiendo pantalla' : 'Esperando al emisor'}</div></div><div className="privacy-card"><ShieldCheck size={20}/><b>Privacidad respetada</b><p>La transmisión se realiza directamente entre navegadores cuando la red lo permite.</p></div></aside></section>}
 </div><footer className="app-footer"><span>© 2026 MirrorLove 24/7</span><span><ShieldCheck size={13}/> Comparte con consentimiento. Detén cuando quieras.</span></footer></main></div>;
 }
 
