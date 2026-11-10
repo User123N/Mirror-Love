@@ -9,7 +9,8 @@ Aplicación web de salas privadas para compartir una pantalla en tiempo real con
 - Unión a una sala mediante RPC protegida; el código no se puede consultar mediante una búsqueda pública de la tabla.
 - Señalización WebRTC mediante Postgres Changes con políticas RLS.
 - Compartir pantalla desde Chrome, Edge o Firefox actualizado en contexto HTTPS/localhost.
-- Vista del espectador, estado de conexión y cierre de sesión.
+- Visualización simultánea en ambas direcciones: cada participante puede compartir su propia pantalla dentro de la misma sala.
+- Vista del espectador, vista previa local, estado de conexión y cierre de sesión.
 - Diseño adaptable a escritorio y móvil.
 - Configuración opcional de TURN para redes restrictivas.
 
@@ -35,7 +36,7 @@ Aplicación web de salas privadas para compartir una pantalla en tiempo real con
    VITE_SUPABASE_ANON_KEY=TU_CLAVE_PUBLICABLE_O_ANON
    ```
 
-4. En Supabase → SQL Editor, ejecuta el contenido de `supabase/migrations/001_initial.sql`.
+4. En Supabase → SQL Editor, ejecuta en orden `supabase/migrations/001_initial.sql` y `supabase/migrations/002_create_session_rpc.sql`. La segunda migración instala la función segura que crea salas y evita depender de un INSERT directo desde el navegador.
 5. En Supabase → Authentication → URL Configuration, configura el Site URL local (`http://localhost:5173`) y añade esa URL a Redirect URLs.
 6. Ejecuta:
 
@@ -59,6 +60,8 @@ Aplicación web de salas privadas para compartir una pantalla en tiempo real con
 `netlify.toml` ya contiene el comando de build, carpeta de publicación y fallback SPA.
 
 ## TURN y conectividad
+
+La app permite que el emisor y el espectador compartan sus pantallas dentro de una misma sesión: el host negocia canales de vídeo/audio bidireccionales desde el inicio y el otro participante puede iniciar su propia captura cuando la conexión esté establecida. Cada persona controla y detiene su propia captura.
 
 La app usa el servidor STUN público de Google como configuración inicial. STUN no garantiza conexión en todas las redes. Para un lanzamiento público fiable, configura un proveedor TURN seguro (por ejemplo, un servicio administrado o coturn propio) y añade sus credenciales como variables de entorno. No publiques credenciales TURN reutilizables en repositorios públicos; utiliza credenciales temporales o rotables cuando tu proveedor lo permita.
 
