@@ -295,6 +295,7 @@ export default function App() {
     setBusy(true); setNotice(null);
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 24, max: 30 } }, audio: true });
+      localStreamRef.current = stream;
       let pc = pcRef.current;
       if (!pc) {
         pc = createPeer(session, true);
@@ -325,6 +326,7 @@ export default function App() {
     setBusy(true); setNotice(null);
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 24, max: 30 } }, audio: true });
+      localStreamRef.current = stream;
       await applyLocalStream(stream, pcRef.current);
       setNotice({ type: 'success', text: 'Ahora ambos pueden ver las pantallas que han autorizado compartir.' });
     } catch (error) {
@@ -336,7 +338,7 @@ export default function App() {
 
   const startViewer = async (current: MirrorSession) => {
     if (!supabase) return;
-    const pc = createPeer(current, false);
+    createPeer(current, false);
     await subscribeSignals(current, false);
     // The viewer receives the remote screen through the shared ontrack handler in createPeer.
   };
